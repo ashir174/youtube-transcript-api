@@ -1,7 +1,0 @@
-{
-  "functions": {
-    "api/transcript.py": {
-      "runtime": "python3.9"
-    }
-  }
-}
