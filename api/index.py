@@ -28,6 +28,7 @@ from urllib.parse import urlparse, parse_qs
 # ---------------------------------------------------------------------------
 
 def _stream_url(video_id: str) -> dict:
+    import os
     import yt_dlp  # imported lazily so cold-start for transcript is faster
 
     ydl_opts = {
@@ -36,7 +37,23 @@ def _stream_url(video_id: str) -> dict:
         "no_warnings": True,
         "skip_download": True,
         "noplaylist": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android", "ios", "tv"],
+                "player_skip": ["webpage", "configs"],
+            }
+        },
     }
+
+    cookie_content = os.environ.get("YOUTUBE_COOKIES")
+    cookie_path = "/tmp/cookies.txt"
+    if cookie_content:
+        try:
+            with open(cookie_path, "w") as f:
+                f.write(cookie_content)
+            ydl_opts["cookiefile"] = cookie_path
+        except Exception:
+            pass
 
     yt_url = f"https://www.youtube.com/watch?v={video_id}"
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
