@@ -1,86 +1,65 @@
 """
 Vercel serverless function: GET /api/stream-url?video_id=<id>
 
-Returns the best audio-only stream URL for a YouTube video, extracted
-server-side by yt-dlp so the device IP is never exposed to YouTube.
+Uses yt-dlp as a Python library (not subprocess) to extract the best
+audio-only stream URL server-side. The device IP never touches YouTube.
 
-Response (200):
-  {
-    "url": "https://...",          # direct audio stream URL (expires ~6 h)
-    "ext": "webm",                 # container extension
-    "filesize": 12345678,          # bytes (may be null)
-    "duration": 360                # seconds (may be null)
-  }
+Response 200:
+  { "url": "...", "ext": "webm", "filesize": 12345678, "duration": 360 }
 
-Error responses:
+Errors:
   400  { "error": "video_id is required" }
-  404  { "error": "No audio stream found" }
-  500  { "error": "<yt-dlp error message>" }
+  404  { "error": "Video unavailable or private" }
+  500  { "error": "<message>" }
 """
 
 import json
-import subprocess
-import sys
-
 from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+import yt_dlp
+
 
 def _get_stream_url(video_id: str) -> dict:
-    """Run yt-dlp in a subprocess and return the best audio stream info."""
+    ydl_opts = {
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        # Don't write anything to disk
+        "noplaylist": True,
+    }
+
     url = f"https://www.youtube.com/watch?v={video_id}"
 
-    # yt-dlp flags:
-    #   -f bestaudio        — best audio-only format
-    #   --get-url           — print the direct URL to stdout
-    #   --print-json        — print full format JSON to stdout (we use this instead)
-    #
-    # We use --dump-single-json to get everything in one shot.
-    result = subprocess.run(
-        [
-            sys.executable, "-m", "yt_dlp",
-            "--quiet",
-            "--no-warnings",
-            "--skip-download",
-            "--format", "bestaudio/best",
-            "--dump-single-json",
-            url,
-        ],
-        capture_output=True,
-        text=True,
-        timeout=25,
-    )
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=False)
 
-    if result.returncode != 0:
-        stderr = result.stderr.strip() or "yt-dlp failed with no output"
-        raise RuntimeError(stderr)
-
-    info = json.loads(result.stdout)
-
-    # Pick the best audio-only format, falling back to the requested format.
-    chosen = None
+    if not info:
+        raise RuntimeError("yt-dlp returned no info")
 
     # Try audio-only formats first (vcodec == "none")
     formats = info.get("formats") or []
     audio_only = [
         f for f in formats
-        if f.get("vcodec", "none") == "none" and f.get("acodec", "none") != "none"
+        if f.get("vcodec", "none") == "none"
+        and f.get("acodec", "none") not in ("none", None)
+        and f.get("url")
     ]
-    if audio_only:
-        # Prefer highest abr (average bitrate)
-        audio_only.sort(key=lambda f: f.get("abr") or 0, reverse=True)
-        chosen = audio_only[0]
 
-    # Fall back to the top-level url (already the best match yt-dlp chose)
-    if not chosen:
+    if audio_only:
+        # Highest average bitrate wins
+        audio_only.sort(key=lambda f: f.get("abr") or f.get("tbr") or 0, reverse=True)
+        chosen = audio_only[0]
+    else:
+        # Fall back to the top-level url yt-dlp already resolved
         top_url = info.get("url")
         if not top_url:
-            raise RuntimeError("No audio stream found")
+            raise RuntimeError("No audio stream found for this video")
         chosen = {
             "url": top_url,
             "ext": info.get("ext", "mp4"),
             "filesize": info.get("filesize"),
-            "duration": info.get("duration"),
         }
 
     return {
@@ -95,29 +74,24 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         params = parse_qs(parsed.query)
-        video_id = params.get("video_id", [None])[0]
+        video_id = (params.get("video_id") or [None])[0]
 
         if not video_id:
             self._respond(400, {"error": "video_id is required"})
             return
 
-        # Sanitise: only allow alphanumeric + hyphen/underscore (YouTube IDs are 11 chars)
+        # Sanitise: YouTube IDs are 11 alphanumeric + hyphen/underscore chars
         if not all(c.isalnum() or c in "-_" for c in video_id) or len(video_id) > 20:
             self._respond(400, {"error": "invalid video_id"})
             return
 
         try:
             data = _get_stream_url(video_id)
-            if not data.get("url"):
-                self._respond(404, {"error": "No audio stream found"})
-            else:
-                self._respond(200, data)
-        except subprocess.TimeoutExpired:
-            self._respond(500, {"error": "yt-dlp timed out (>25 s)"})
-        except RuntimeError as e:
+            self._respond(200, data)
+        except yt_dlp.utils.DownloadError as e:
             msg = str(e)
-            if "Video unavailable" in msg or "Private video" in msg:
-                self._respond(404, {"error": msg})
+            if "Video unavailable" in msg or "Private video" in msg or "not available" in msg:
+                self._respond(404, {"error": "Video unavailable or private"})
             else:
                 self._respond(500, {"error": msg})
         except Exception as e:
@@ -132,4 +106,4 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(payload)
 
     def log_message(self, *args):
-        pass  # silence default access log
+        pass  # silence default request logging
